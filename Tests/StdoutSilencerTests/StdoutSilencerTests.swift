@@ -16,22 +16,26 @@ import Testing
 @Suite("Standard output", .serialized)
 struct StdoutSilencerTests {
 
-    /// What reaches stdout while `body` runs, caught in a file.
-    private func caught(_ body: () async throws -> Void) async throws -> String {
+    /// What reaches stdout (or `descriptor`) while `body` runs, caught in a file.
+    private func caught(_ descriptor: Int32 = STDOUT_FILENO,
+                        _ body: () async throws -> Void) async throws -> String {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("stdout-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: file) }
         fflush(stdout)
-        let real = dup(STDOUT_FILENO)
+        fflush(stderr)
+        let real = dup(descriptor)
         let sink = open(file.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
-        dup2(sink, STDOUT_FILENO)
+        dup2(sink, descriptor)
         close(sink)
         defer {
             fflush(stdout)
-            dup2(real, STDOUT_FILENO)
+            fflush(stderr)
+            dup2(real, descriptor)
             close(real)
         }
         try await body()
         fflush(stdout)
+        fflush(stderr)
         return try String(contentsOf: file, encoding: .utf8)
     }
 
@@ -91,13 +95,13 @@ struct StdoutSilencerTests {
     @Test("Overlapping uses: stdout comes back only when the last one ends")
     func overlapping() async throws {
         let out = try await caught {
-            Diversion.begin()
-            Diversion.begin()
+            Diversion.output.begin()
+            Diversion.output.begin()
             #expect(StandardOutput.isSilenced)
-            Diversion.end()
+            Diversion.output.end()
             print("still loading")
             #expect(StandardOutput.isSilenced)
-            Diversion.end()
+            Diversion.output.end()
             #expect(!StandardOutput.isSilenced)
             print("the JSON")
         }
@@ -123,5 +127,26 @@ struct StdoutSilencerTests {
         }
         #expect(!out.contains("load "))
         #expect(out.contains("after all four"))
+    }
+
+    @Test("Standard error is silenced on its own, and comes back")
+    func standardError() async throws {
+        let errors = try await caught(STDERR_FILENO) {
+            let printed = try await caught {
+                StandardError.silenced {
+                    #expect(StandardError.isSilenced)
+                    #expect(!StandardOutput.isSilenced, "stdout is not touched")
+                    fputs("CoreData: debug: WAL checkpoint\n", stderr)
+                    _ = "progress\n".withCString { write(STDERR_FILENO, $0, strlen($0)) }
+                    print("the JSON")
+                }
+            }
+            #expect(printed.contains("the JSON"))
+            #expect(!StandardError.isSilenced)
+            fputs("scene.mov (1/1)…\n", stderr)
+        }
+        #expect(!errors.contains("CoreData"))
+        #expect(!errors.contains("progress"))
+        #expect(errors.contains("scene.mov (1/1)"))
     }
 }
